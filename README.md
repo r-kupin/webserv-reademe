@@ -360,6 +360,58 @@ Stores data about all [locations](#location) mentioned in config:
     bool                    ghost_;
 ```
 ## Setting up servers
+Each server gets initialized in a following way:
+### Opening of a socket
+The external interface of a server is a socket. It is a data structure that represents an endpoint for communication. It's basically a like a file descriptor used by the kernel to manage network communication between processes. In order to open socket for communication several setup steps are required.
+#### Create socket
+When the `socket` system call is invoked, the Linux kernel allocates a new file descriptor and initializes data structures for the socket. Internally, this involves allocating memory for the socket control block and setting up pointers to various kernel functions related to socket operations. Additionally, the kernel initializes the socket's state and other attributes, such as its protocol family, type, and communication semantics (e.g., TCP, UDP, stream-oriented, datagram-oriented).
+#### Set socket options
+After the socket is created, certain options may need to be configured to customize its behavior. For instance, the `SO_REUSEADDR` option, set using the `setsockopt` system call, modifies the socket's behavior regarding address reuse. When this option is set, the kernel updates the socket's internal data structures to indicate that the address and port associated with the socket can be reused even if it's still in a `TIME_WAIT` state from a previous connection. This enables faster server restarts and prevents "address already in use" errors.
+#### Bind socket
+Binding a socket to a specific address and port is achieved through the `bind` system call. When this call is made, the kernel updates its internal routing tables to include an entry mapping the specified address and port to the socket's file descriptor. This essentially tells the networking subsystem of the kernel to direct incoming packets destined for the specified address and port to the socket for processing. The kernel also checks for permissions and ensures that the requested address and port are available for binding.
+#### Start listening
+Once the socket is bound to an address and port, it needs to start listening for incoming connections. Invoking the `listen` system call sets the socket's state to listening and configures it to accept incoming connections. Internally, the kernel sets up a queue for pending connections associated with the socket and begins accepting incoming connection requests. The backlog(last) parameter passed to `listen` determines the maximum length of this queue. In my case it is `SOMAXCONN` - a maximum amount of connections, which is **4096** on 42's computers.  As new connection requests arrive, the kernel adds them to the queue, up to the specified backlog limit. If  the queue is full, subsequent connection requests may be rejected.
+
+When socket is set up to listen for the connections it is fully usable. 
+### Setting up epoll
+The **epoll** API performs monitoring of multiple file descriptors to see if I/O is possible on any of them. The **epoll** API can be used either as an edge-triggered or a level-triggered interface and scales well to large numbers of watched file descriptors.
+The following system calls are provided to create and manage an **epoll** instance:
+#### Create epoll instance
+`epoll_create` asks kernel to create epoll instance - red-black tree set of file descriptors being monitored. The integer returned by this call represents a file descriptor referring to the newly created epoll instance.
+#### Add socket to the epoll watchlist
+The `epoll_ctl` system call is used to control the behavior of the epoll instance, such as adding or removing file descriptors from its watch list, or changing the events of a file descriptor already in the list.
+There are options on how do we want to get notified about events, and what particular events to monitor. This is done, by setting flags to `epoll_event.events`.
+##### Kinds of events
+For example setting the flag `EPOLLIN` would mean that we'll get notified when on the client's end of the communication line `write` or similar operation will be performed. `EPOLLOUT` - same but for `read` or similar.
+##### Notification strategy
+Alongside with `EPOLLIN` and/or `EPOLLOUT` the `EPOLLET` flag might be specified - if so, notifications on this file descriptor would be **Edge Triggered**. Otherwise the default **Level Triggered** strategy will be applied.
+###### Edge Triggered notifications
+Events are triggered only if they change the state of the `fd` - meaning that only the first event is triggered and no new events will get triggered until that event is fully handled. 
+This design is explicitly meant to prevent `epoll_wait` from returning due to an event that is in the process of being handled (i.e., when new data arrives while the `EPOLLIN` was already raised but `read` hadn't been called or not all of the data was read). The edge-triggered event rule is simple **all same-type (i.e. `EPOLLIN`) events are _merged_ until all available data was processed**. 
+In the case of a listening socket, the `EPOLLIN` event won't be triggered again until all existing `listen` "backlog" sockets have been accepted using `accept`.
+In the case of a byte stream, new events won't be triggered until all the the available bytes have been read from the stream (the buffer was emptied).    
+###### Level Triggered
+On the other hand, level triggered events will behave closer to how legacy `select` (or `poll`) operates, allowing `epoll` to be used with older code.
+The event-merger rule is more complex: **events of the same type are only merged if no one is waiting for an event** (no one is waiting for `epoll_wait` to return), **or if multiple events happen before `epoll_wait` can return**... otherwise any event causes `epoll_wait` to return.
+In the case of a listening socket, the `EPOLLIN` event will be triggered every time a client connects... unless no one is waiting for `epoll_wait` to return, in which case the next call for `epoll_wait` will return immediately and all the `EPOLLIN` events that occurred during that time will have been merged into a single event.
+In the case of a byte stream, new events will be triggered every time new data comes in... unless, of course, no one is waiting for `epoll_wait` to return, in which case the next call will return immediately for all the data that arrive util `epoll_wait` returned (even if it arrived in different chunks / events).
+
+More on that [here](https://linux.die.net/man/7/epoll) and [here](https://stackoverflow.com/questions/41582560/how-does-epolls-epollexclusive-mode-interact-with-level-triggering). If you are super curious about the topic - check out [this](http://www.kegel.com/c10k.html) as well.
+
+When adding a socket to the epoll watch list, the `EPOLL_CTL_ADD` command is used. This command instructs the kernel to add the specified socket to the epoll instance's watch list, associating it with a set of events to monitor (e.g., read, write, error).
+#### Wait for the event to happen
+The `epoll_wait` system call is used to wait for events on the file descriptors registered with the epoll instance. When invoked, it blocks current thread until one or more file descriptors in the epoll instance's watch list become ready for the specified events, or until a timeout occurs. Upon completion, `epoll_wait` returns information about the ready file descriptors and the events that occurred by placing `epoll_event` structures in events array. Internally, the kernel efficiently scans the epoll instance's data structures to determine which file descriptors are ready for I/O operations, without the need for iterative polling. 
+## Accepting connections
+After setting up the epoll instance, the server proceeds with accepting incoming connections from clients using the `accept` system call to accept the connection request and create a new socket descriptor specifically for this connection. Internally, the Linux kernel performs several steps when accept is called:
+- It extracts the first connection request on the queue of pending connections for the listening `socket_` - main socket of the server
+- Once a connection request is received, the kernel creates a new socket descriptor `client_sock` and sets up a new file structure for it, representing the connection.
+- If successful, `accept` returns the new socket descriptor for the accepted connection.
+#### Set client's fd to non-blocking state
+After accepting the connection and obtaining the new socket descriptor `client_sock`, the server sets this socket to non-blocking mode using the `fcntl` system call. This step ensures that subsequent I/O operations on this socket will not block the calling thread. It's done by adding `O_NONBLOCK` flag to those already set.
+#### Add client's fd to epoll
+Just like with server's sockets - this way we'll be monitoring the events happening on it.
+#### Read client's message from socket
+As simple as it is - just use nonblocking `read` or socket-specific `recv` to read from fd.
 ## [Request](https://developer.mozilla.org/en-US/docs/Web/HTTP/Messages#http_requests) handling
 HTTP request is a message sent by a client to a server:
 
@@ -482,7 +534,7 @@ Server creates response in a following way:
 		2. If an external or internal address is provided, sets the `Location` header accordingly.
 	4. If a body file is specified, its content is read.
 4. Sets additional headers like `Content-Type`, `Content-Length`, and `Connection`.
-
+### Sending response back to client
 #  Additional info
 ## Server response codes implemented
 ### OK
